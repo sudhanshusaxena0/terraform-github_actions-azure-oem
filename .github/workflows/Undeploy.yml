@@ -1,0 +1,156 @@
+name: 'Undeploy'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'NonProd'
+        type: choice
+        options:
+          - 'NonProd'
+          - 'Prod'
+ 
+env:
+  ARM_CLIENT_ID: "${{ secrets.CLIENT_ID }}"
+  ARM_SUBSCRIPTION_ID: "${{ secrets.SUBSCRIPTION_ID }}"
+  ARM_TENANT_ID: "${{ secrets.TENANT_ID }}"
+  ARM_CLIENT_SECRET: "${{ secrets.CLIENT_SECRET }}"
+
+jobs:
+  Delete-AZU-Resources:
+    name: "Delete-AZU-Resources"
+    runs-on: { group: ubuntu-uhg }
+    environment: ${{ github.event.inputs.environment }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        id: 'Checkout'
+        uses: actions/checkout@v4
+
+      - name: Update variables terraform tf files
+        id: 'Update-variables-terraform-tf-files'
+        run: |
+          sed -i "s/__TF-RG__/${{ vars.TF_RG }}/g" terraform.tf
+          sed -i "s/__TF-STG-ACCT__/${{ vars.TF_STG_ACCT }}/g" terraform.tf
+          sed -i "s/__TF-STG-CONTAINER__/${{ vars.TF_STG_CONTAINER }}/g" terraform.tf
+          sed -i "s/__SUBSCRIPTION__/${{ secrets.SUBSCRIPTION_ID }}/g" variables.tf
+
+      - name: Setup Terraform
+        id: 'Setup-Terraform'
+        uses: hashicorp/setup-terraform@v1
+
+      - name: Terraform Init
+        id: 'Terraform-Init'
+        run: terraform init
+
+      - name: Terraform Validate
+        id: 'Terraform-Validate'
+        run: terraform validate -no-color
+
+      - name: Terraform Destroy 
+        id: 'Terraform-Destroy'
+        run: terraform destroy -auto-approve -input=false
+
+  delete-tf-backend:
+    name: "delete-tf-backend"
+    runs-on: { group: ubuntu-uhg }
+    environment: ${{ github.event.inputs.environment }}
+    needs: "Delete-AZU-Resources"
+    if: always()
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Azure CLI Login
+        id: 'Azure-CLI-Login'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZU_CRED }}
+
+      - name: Delete Backend Storage Account
+        id: 'Delete-Backend-Storage-Account'
+        run: |
+         az storage account delete \
+           --resource-group ${{ vars.TF_RG }} \
+           --name ${{ vars.TF_STG_ACCT }} \
+           --yes
+
+      - name: Delete Backend Resource Group
+        id: 'Delete-Backend-Resource-Group'
+        run: |
+          az group delete --name ${{ vars.TF_RG }} --yes --no-wait
+
+  Success-Notification:
+    name: "Success-Notification"
+    runs-on: uhg-runner
+    environment: ${{ github.event.inputs.environment }}
+    needs:
+      - "delete-tf-backend"
+    if: success()
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Send Success E-Mail
+        id: 'Send-Success-E-Mail'
+        run: |
+          branch_name="${{ github.ref }}"
+          branch_name="${branch_name#refs/heads/}"
+          curl \
+          --url "smtp://${{ vars.SMTP_SERVER }}:25" \
+          --mail-from ${{ vars.EMAIL_FROM }} \
+          --mail-rcpt ${{ vars.EMAIL_TO }} \
+          --upload-file - <<EOF
+          From: ${{ vars.EMAIL_FROM_NAME }} <${{ vars.EMAIL_FROM }}>
+          To: ${{ vars.EMAIL_TO_NAME }} <${{ vars.EMAIL_TO }}>
+          Subject: [${{ github.repository }}] Run succeeded: ${{ github.workflow }} - ${{ github.event.inputs.environment }} - ${branch_name} (${{ github.run_id }})
+          Content-Type: text/html; charset="utf-8"
+          Content-Transfer-Encoding: quoted-printable
+          Content-Disposition: inline
+
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+
+  Failure-Notification:
+    name: "Failure-Notification"
+    runs-on: uhg-runner
+    environment: ${{ github.event.inputs.environment }}
+    needs:
+      - "Delete-AZU-Resources"
+      - "delete-tf-backend"
+    if: failure()
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Send Failure E-Mail
+        id: 'Send-Failure-E-Mail'
+        run: |
+          branch_name="${{ github.ref }}"
+          branch_name="${branch_name#refs/heads/}"
+          curl \
+          --url "smtp://${{ vars.SMTP_SERVER }}:25" \
+          --mail-from ${{ vars.EMAIL_FROM }} \
+          --mail-rcpt ${{ vars.EMAIL_TO }} \
+          --upload-file - <<EOF
+          From: ${{ vars.EMAIL_FROM_NAME }} <${{ vars.EMAIL_FROM }}>
+          To: ${{ vars.EMAIL_TO_NAME }} <${{ vars.EMAIL_TO }}>
+          Subject: [${{ github.repository }}] Run failed: ${{ github.workflow }} - ${{ github.event.inputs.environment }} - ${branch_name} (${{ github.run_id }})
+          Content-Type: text/html; charset="utf-8"
+          Content-Transfer-Encoding: quoted-printable
+          Content-Disposition: inline
+
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
